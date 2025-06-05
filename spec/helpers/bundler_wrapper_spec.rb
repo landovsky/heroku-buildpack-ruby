@@ -15,9 +15,6 @@ end
 describe "Bundler version detection" do
   it "supports minor versions" do
     wrapper_klass = LanguagePack::Helpers::BundlerWrapper
-    version = wrapper_klass.detect_bundler_version(contents: "BUNDLED WITH\n   1.17.3")
-    expect(wrapper_klass::BLESSED_BUNDLER_VERSIONS.key?("1")).to be_truthy
-    expect(version).to eq(wrapper_klass::BLESSED_BUNDLER_VERSIONS["1"])
 
     version = wrapper_klass.detect_bundler_version(contents: "BUNDLED WITH\n   2.2.7")
     expect(wrapper_klass::BLESSED_BUNDLER_VERSIONS.key?("2.3")).to be_truthy
@@ -36,8 +33,12 @@ describe "Bundler version detection" do
     expect(version).to eq(wrapper_klass::BLESSED_BUNDLER_VERSIONS["2.5"])
 
     version = wrapper_klass.detect_bundler_version(contents: "BUNDLED WITH\n   2.6.7")
-    expect(wrapper_klass::BLESSED_BUNDLER_VERSIONS.key?("2.5")).to be_truthy
-    expect(version).to eq(wrapper_klass::BLESSED_BUNDLER_VERSIONS["2.5"])
+    expect(wrapper_klass::BLESSED_BUNDLER_VERSIONS.key?("2.6")).to be_truthy
+    expect(version).to eq(wrapper_klass::BLESSED_BUNDLER_VERSIONS["2.6"])
+
+    version = wrapper_klass.detect_bundler_version(contents: "BUNDLED WITH\n   2.999.7")
+    expect(wrapper_klass::BLESSED_BUNDLER_VERSIONS.key?("2.6")).to be_truthy
+    expect(version).to eq(wrapper_klass::BLESSED_BUNDLER_VERSIONS["2.6"])
 
     expect {
       wrapper_klass.detect_bundler_version(contents: "BUNDLED WITH\n   3.6.7")
@@ -50,19 +51,22 @@ describe "Multiple platform detection" do
     Dir.mktmpdir do |dir|
       gemfile = Pathname(dir).join("Gemfile")
       lockfile = Pathname(dir).join("Gemfile.lock").tap {|p| p.write("BUNDLED WITH\n   2.5.7") }
+      report = HerokuBuildReport.dev_null
 
-      bundler = LanguagePack::Helpers::BundlerWrapper.new(gemfile_path: gemfile)
-      expect(bundler.supports_multiple_platforms?).to be_truthy
-    end
-  end
-
-  it "reports false on bundler prior to 2.2" do
-    Dir.mktmpdir do |dir|
-      gemfile = Pathname(dir).join("Gemfile")
-      lockfile = Pathname(dir).join("Gemfile.lock").tap {|p| p.write("BUNDLED WITH\n   1.15.2") }
-
-      bundler = LanguagePack::Helpers::BundlerWrapper.new(gemfile_path: gemfile)
-      expect(bundler.supports_multiple_platforms?).to be_falsey
+      bundler = LanguagePack::Helpers::BundlerWrapper.new(
+        gemfile_path: gemfile,
+        report: report
+      )
+      expect(report.data).to eq(
+        {
+          "ruby.dot_ruby_version" => nil,
+          "bundler.bundled_with" => "2.5.7",
+          "bundler.major" => "2",
+          "bundler.minor" => "5",
+          "bundler.patch" => "23",
+          "bundler.version_installed" => "2.5.23",
+        }
+      )
     end
   end
 end
@@ -106,30 +110,10 @@ describe "BundlerWrapper mutates rubyopt" do
     end
   end
 
-  it "detects windows gemfiles" do
-    Hatchet::App.new("rails4_windows_mri193").in_directory_fork do |dir|
-      Bundler.with_unbundled_env do
-        expect(@bundler.install.windows_gemfile_lock?).to be_truthy
-      end
-    end
-  end
-
   describe "when executing bundler" do
-    it "handles apps with ruby versions locked in Gemfile.lock" do
-      Hatchet::App.new("problem_gemfile_version").in_directory_fork do |dir|
-        Bundler.with_unbundled_env do
-          @bundler.install
-
-          expect(@bundler.ruby_version).to include("ruby-2.5.1")
-
-          ruby_version = LanguagePack::RubyVersion.new(@bundler.ruby_version, is_new: true)
-          expect(ruby_version.version_for_download).to include("ruby-2.5.1")
-        end
-      end
-    end
-
     it "handles JRuby pre gemfiles" do
       Hatchet::App.new("jruby-minimal").in_directory_fork do |dir|
+        require "bundler"
         Bundler.with_unbundled_env do
           @bundler.install
 

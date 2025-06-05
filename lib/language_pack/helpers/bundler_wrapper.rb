@@ -36,17 +36,20 @@ class LanguagePack::Helpers::BundlerWrapper
   include LanguagePack::ShellHelpers
 
   BLESSED_BUNDLER_VERSIONS = {}
-  BLESSED_BUNDLER_VERSIONS["1"] = "1.17.3"
-  # Heroku-20's oldest Ruby verison is 2.5.x which doesn't work with bundler 2.4
+  # Heroku-22's oldest Ruby version is 3.1
   BLESSED_BUNDLER_VERSIONS["2.3"] = "2.3.25"
   BLESSED_BUNDLER_VERSIONS["2.4"] = "2.4.22"
-  BLESSED_BUNDLER_VERSIONS["2.5"] = "2.5.6"
+  BLESSED_BUNDLER_VERSIONS["2.5"] = "2.5.23"
+  BLESSED_BUNDLER_VERSIONS["2.6"] = "2.6.2"
+
+  DEFAULT_VERSION = BLESSED_BUNDLER_VERSIONS["2.3"]
+
+  # Convert arbitrary `<Major>.<Minor>.x` versions
   BLESSED_BUNDLER_VERSIONS.default_proc = Proc.new do |hash, key|
-    if Gem::Version.new(key).segments.first == 1
-      hash["1"]
-    elsif Gem::Version::new(key).segments.first == 2
-      if Gem::Version.new(key) > Gem::Version.new("2.5")
-        hash["2.5"]
+    case Gem::Version.new(key).segments.first
+    when 2
+      if Gem::Version.new(key) > Gem::Version.new("2.6")
+        hash["2.6"]
       elsif Gem::Version.new(key) < Gem::Version.new("2.3")
         hash["2.3"]
       else
@@ -57,18 +60,18 @@ class LanguagePack::Helpers::BundlerWrapper
     end
   end
 
-  def self.detect_bundler_version(contents: )
-    version_match = contents.match(BUNDLED_WITH_REGEX)
-    if version_match
-      major = version_match[:major]
-      minor = version_match[:minor]
-      BLESSED_BUNDLER_VERSIONS["#{major}.#{minor}"]
+  def self.detect_bundler_version(contents: , bundled_with: contents.match(BUNDLED_WITH_REGEX))
+    if bundled_with
+      major = bundled_with[:major]
+      minor = bundled_with[:minor]
+      version = BLESSED_BUNDLER_VERSIONS["#{major}.#{minor}"]
+      version
     else
-      BLESSED_BUNDLER_VERSIONS["1"]
+      DEFAULT_VERSION
     end
   end
 
-  BUNDLED_WITH_REGEX = /^BUNDLED WITH$(\r?\n)   (?<major>\d+)\.(?<minor>\d+)\.\d+/m
+  BUNDLED_WITH_REGEX = /^BUNDLED WITH$(\r?\n)   (?<version>(?<major>\d+)\.(?<minor>\d+)\.\d+)/m
 
   class GemfileParseError < BuildpackError
     def initialize(error)
@@ -90,7 +93,7 @@ class LanguagePack::Helpers::BundlerWrapper
       msg << "\n"
       msg << "```\n"
       msg << "BUNDLED WITH\n"
-      msg << "   #{version_hash["1"]}\n"
+      msg << "   #{DEFAULT_VERSION}\n"
       msg << "```\n"
       super msg
     end
@@ -98,17 +101,43 @@ class LanguagePack::Helpers::BundlerWrapper
 
   attr_reader :bundler_path
 
-  def initialize(options = {})
+  def initialize(
+      bundler_path: nil,
+      gemfile_path: Pathname.new("./Gemfile"),
+      report: HerokuBuildReport::GLOBAL
+    )
+    @report               = report
     @bundler_tmp          = Pathname.new(Dir.mktmpdir)
-    @fetcher              = options[:fetcher]      || LanguagePack::Fetcher.new(LanguagePack::Base::VENDOR_URL) # coupling
-    @gemfile_path         = options[:gemfile_path] || Pathname.new("./Gemfile")
+    @fetcher              = LanguagePack::Fetcher.new(LanguagePack::Base::VENDOR_URL) # coupling
+    @gemfile_path         = gemfile_path
     @gemfile_lock_path    = Pathname.new("#{@gemfile_path}.lock")
 
-    @version = self.class.detect_bundler_version(contents: @gemfile_lock_path.read(mode: "rt"))
+    contents = @gemfile_lock_path.read(mode: "rt")
+    bundled_with = contents.match(BUNDLED_WITH_REGEX)
+    dot_ruby_version_file = @gemfile_lock_path.join("..").join(".ruby-version")
+    @report.capture(
+      "bundler.bundled_with" => bundled_with&.[]("version") || "empty",
+      # We use this bundler class to detect the Requested ruby version from the Gemfile.lock
+      # Rails 8 stopped generating `RUBY VERSION` in the Gemfile.lock and started generating
+      # a `.ruby-version` file. This will observe the formats to help guide implementation
+      # decisions
+      "ruby.dot_ruby_version" => dot_ruby_version_file.exist? ? dot_ruby_version_file.read&.strip : nil
+    )
+    @version = self.class.detect_bundler_version(
+      contents: contents,
+      bundled_with: bundled_with
+    )
+    parts = @version.split(".")
+    @report.capture(
+      "bundler.version_installed" => @version,
+      "bundler.major" => parts&.shift,
+      "bundler.minor" => parts&.shift,
+      "bundler.patch" => parts&.shift
+    )
     @dir_name = "bundler-#{@version}"
 
-    @bundler_path         = options[:bundler_path] || @bundler_tmp.join(@dir_name)
-    @bundler_tar          = options[:bundler_tar]  || "bundler/#{@dir_name}.tgz"
+    @bundler_path         = bundler_path || @bundler_tmp.join(@dir_name)
+    @bundler_tar          = "bundler/#{@dir_name}.tgz"
     @orig_bundle_gemfile  = ENV['BUNDLE_GEMFILE']
     @path                 = Pathname.new("#{@bundler_path}/gems/#{@dir_name}/lib")
   end
@@ -137,20 +166,8 @@ class LanguagePack::Helpers::BundlerWrapper
     end
   end
 
-  # detects whether the Gemfile.lock contains the Windows platform
-  # @return [Boolean] true if the Gemfile.lock was created on Windows
-  def windows_gemfile_lock?
-    platforms.detect do |platform|
-      /mingw|mswin/.match(platform.os) if platform.is_a?(Gem::Platform)
-    end
-  end
-
   def specs
     @specs ||= lockfile_parser.specs.each_with_object({}) {|spec, hash| hash[spec.name] = spec }
-  end
-
-  def platforms
-    @platforms ||= lockfile_parser.platforms
   end
 
   def version
@@ -177,28 +194,26 @@ class LanguagePack::Helpers::BundlerWrapper
 
     ruby_version = self.class.platform_to_version(output)
     if ruby_version.nil? || ruby_version.empty?
-      if Gem::Version.new(self.version) > Gem::Version.new("2.3")
-        warn(<<~WARNING, inline: true)
-          No ruby version specified in the Gemfile.lock
+      warn(<<~WARNING, inline: true)
+        No ruby version specified in the Gemfile.lock
 
-          We could not determine the version of Ruby from your Gemfile.lock.
+        We could not determine the version of Ruby from your Gemfile.lock.
 
-            $ bundle platform --ruby
-            #{output}
+          $ bundle platform --ruby
+          #{output}
 
-            $ bundle -v
-            #{run("bundle -v", user_env: true, env: env)}
+          $ bundle -v
+          #{run("bundle -v", user_env: true, env: env)}
 
-          Ensure the above command outputs the version of Ruby you expect. If you have a ruby version specified in your Gemfile, you can update the Gemfile.lock by running the following command:
+        Ensure the above command outputs the version of Ruby you expect. If you have a ruby version specified in your Gemfile, you can update the Gemfile.lock by running the following command:
 
-            $ bundle update --ruby
+          $ bundle update --ruby
 
-          Make sure you commit the results to git before attempting to deploy again:
+        Make sure you commit the results to git before attempting to deploy again:
 
-            $ git add Gemfile.lock
-            $ git commit -m "update ruby version"
-        WARNING
-      end
+          $ git add Gemfile.lock
+          $ git commit -m "update ruby version"
+      WARNING
     end
     ruby_version
   end
@@ -215,19 +230,6 @@ class LanguagePack::Helpers::BundlerWrapper
     @lockfile_parser ||= parse_gemfile_lock
   end
 
-  # Some bundler versions have different behavior
-  # if config is global versus local. These versions need
-  # the environment variable BUNDLE_GLOBAL_PATH_APPENDS_RUBY_SCOPE=1
-  def needs_ruby_global_append_path?
-    Gem::Version.new(@version) < Gem::Version.new("2.1.4")
-  end
-
-  # Bundler 2.2 introduced support for multiple "platforms" in the Gemfile.lock
-  # For more information see https://github.com/heroku/heroku-buildpack-ruby/issues/1157
-  def supports_multiple_platforms?
-    Gem::Version.new(@version) >= Gem::Version.new("2.2")
-  end
-
   def bundler_version_escape_valve!
     topic("Removing BUNDLED WITH version in the Gemfile.lock")
     contents = File.read(@gemfile_lock_path, mode: "rt")
@@ -238,7 +240,7 @@ class LanguagePack::Helpers::BundlerWrapper
 
   private
   def fetch_bundler
-    return true if Dir.exists?(bundler_path)
+    return true if Dir.exist?(bundler_path)
 
     topic("Installing bundler #{@version}")
     bundler_version_escape_valve!

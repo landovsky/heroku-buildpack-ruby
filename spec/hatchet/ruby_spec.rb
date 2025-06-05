@@ -1,41 +1,6 @@
 require_relative '../spec_helper'
 
 describe "Ruby apps" do
-  describe "with mingw platform" do
-    it "is detected as a Windows app" do
-      Hatchet::Runner.new("default_ruby").tap do |app|
-        app.before_deploy do
-          Pathname("Gemfile").write(<<~'EOF')
-            source "https://rubygems.org"
-
-            gem "rake"
-          EOF
-
-          Pathname("Gemfile.lock").write(<<~'EOF')
-            GEM
-              remote: https://rubygems.org/
-              specs:
-                rake (13.2.1)
-
-            PLATFORMS
-              x86-mingw32
-              ruby
-
-            DEPENDENCIES
-              rake
-
-            BUNDLED WITH
-               2.5.9
-          EOF
-        end
-
-        app.deploy do
-          expect(app.output).to include("Windows platform detected, preserving `Gemfile.lock`")
-        end
-      end
-    end
-  end
-
   # https://github.com/heroku/heroku-buildpack-ruby/issues/1025
   describe "bin/rake binstub" do
     it "loads git gems at build time when executing `rake`" do
@@ -145,7 +110,8 @@ describe "Ruby apps" do
     it "works" do
       buildpacks = [
         :default,
-        "https://github.com/sharpstone/force_absolute_paths_buildpack"
+        "https://github.com/sharpstone/force_absolute_paths_buildpack",
+        "https://github.com/heroku/heroku-buildpack-inline.git",
       ]
       config = {FORCE_ABSOLUTE_PATHS_BUILDPACK_IGNORE_PATHS: "BUNDLE_PATH"}
 
@@ -154,8 +120,6 @@ describe "Ruby apps" do
         app.before_deploy do
           Pathname("Gemfile").write(<<~'EOF')
             source "https://rubygems.org"
-
-            ruby "~> 3.0.0"
 
             gem "rake"
           EOF
@@ -174,10 +138,7 @@ describe "Ruby apps" do
               rake
 
             RUBY VERSION
-              ruby 3.0.3p157
-
-            BUNDLED WITH
-               2.3.7
+               ruby 3.3.1p0
           EOF
 
           Pathname("Rakefile").write(<<~'EOF')
@@ -194,10 +155,47 @@ describe "Ruby apps" do
           dir = Pathname("client")
           dir.mkpath
           FileUtils.touch(dir.join(".gitkeep"))
+
+          # Inline buildpack to ensure build_report file is emitted on compile
+          bin = Pathname("bin").tap(&:mkpath)
+          detect = bin.join("detect")
+          compile = bin.join("compile")
+          release = bin.join("release")
+
+          [detect, compile, release].each do |path|
+            FileUtils.touch(path)
+            FileUtils.chmod("+x", path)
+            path.write(<<~EOF)
+              #!/usr/bin/env bash
+              exit 0
+            EOF
+          end
+
+          compile.write(<<~EOF)
+            #!/usr/bin/env bash
+            REPORT_FILE="${CACHE_DIR}/.heroku/ruby/build_report.yml"
+            echo "## PRINTING REPORT FILE ##"
+            #{Pathname(__dir__).join("..").join("..").join("bin").join("report").read}
+            echo "## REPORT FILE DONE ##"
+          EOF
         end
 
         app.deploy do |app|
-          expect(app.output).to match("cd version ruby 3.0.3")
+          expected = "3.3.1"
+          expect(expected).to_not eq(LanguagePack::RubyVersion::DEFAULT_VERSION_NUMBER)
+          expect(app.output).to match("cd version ruby #{expected}")
+          begin
+            report_match = app.output.match(/## PRINTING REPORT FILE ##(?<yaml>.*)## REPORT FILE DONE/m) # https://rubular.com/r/FfaV5AEstigaMO
+            expect(report_match).to be_truthy
+            yaml = report_match[:yaml].gsub(/remote: /, "")
+            report = YAML.load(yaml)
+            expect(report.fetch("ruby.version")).to eq(expected)
+          rescue Exception => e
+            puts app.output
+            puts yaml if yaml
+            puts report.inspect if report
+            raise e
+          end
 
           expect(app.run("which ruby").strip).to eq("/app/bin/ruby")
         end
@@ -207,12 +205,15 @@ describe "Ruby apps" do
 
   describe "bundler ruby version matcher" do
     it "installs a version even when not present in the Gemfile.lock" do
+      version = "3.3.1"
+      expect(version).to_not eq(LanguagePack::RubyVersion::DEFAULT_VERSION_NUMBER)
+
       Hatchet::Runner.new('default_ruby', stack: DEFAULT_STACK).tap do |app|
         app.before_deploy do
-          Pathname("Gemfile").write(<<~'EOF')
+          Pathname("Gemfile").write(<<~EOF)
             source "https://rubygems.org"
 
-            ruby "~> 3.0.0"
+            ruby "#{version}"
 
             gem "sinatra"
           EOF
@@ -240,27 +241,14 @@ describe "Ruby apps" do
 
             DEPENDENCIES
               sinatra
-
-            BUNDLED WITH
-               2.3.7
           EOF
 
         end
 
         app.deploy do |app|
           # Intentionally different than the default ruby version
-          expect(app.output).to         match("3.0.0")
-          expect(app.run("ruby -v")).to match("3.0.0")
-        end
-      end
-    end
-  end
-
-  describe "Rake detection" do
-    context "Ruby 1.9+" do
-      it "runs a rake task if the gem exists" do
-        Hatchet::Runner.new('default_with_rakefile').deploy do |app, heroku|
-          expect(app.output).to include("foo")
+          expect(app.output).to         match("#{version}")
+          expect(app.run("ruby -v")).to match("#{version}")
         end
       end
     end
@@ -279,8 +267,10 @@ describe "Ruby apps" do
 
     context "active record 4.1+" do
       it "doesn't write a heroku specific database.yml" do
-        Hatchet::Runner.new("activerecord41_scaffold").deploy do |app, heroku|
-          expect(app.output).not_to include("Writing config/database.yml to read from DATABASE_URL")
+        Hatchet::Runner.new("rails61", config: rails_lts_config, stack: rails_lts_stack).tap do |app|
+          app.deploy do
+            expect(app.output).not_to include("Writing config/database.yml to read from DATABASE_URL")
+          end
         end
       end
     end
